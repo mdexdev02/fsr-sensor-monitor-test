@@ -1,0 +1,867 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>인솔 압력 히트맵 시뮬레이터 V.3.4.4 (듀얼 뷰)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.client.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+        /* Custom styles from the React component */
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        .canvas-container {
+            position: relative;
+            width: 300px;
+            height: 600px;
+            border: 2px solid #ccc;
+            border-radius: 20px;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+            background-color: transparent; 
+        }
+        .insole-canvas, .overlay-canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            border-radius: 20px;
+        }
+        .control-button {
+            transition: all 0.2s ease-in-out;
+        }
+        .control-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 10px rgba(255, 255, 255, 0.1); 
+        }
+        .control-button:active {
+            transform: translateY(0);
+            box-shadow: 0 2px 5px rgba(255, 255, 255, 0.1); 
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            margin-bottom: 4px;
+        }
+        .legend-color-box {
+            width: 20px;
+            height: 20px;
+            margin-right: 8px;
+            border-radius: 4px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        .floating-value {
+            position: absolute;
+            background-color: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 14px;
+            pointer-events: none; 
+            transform: translate(15px, 15px); 
+            z-index: 1000;
+        }
+        .analysis-box {
+            background-color: #2a2a2a;
+            border: 1px solid #444;
+            border-radius: 8px;
+            padding: 16px;
+            margin-top: 10px;
+            max-width: 500px;
+            width: 100%;
+            min-height: 80px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            font-size: 0.875rem;
+        }
+        .graph-canvas {
+            border: 1px solid #444;
+            border-radius: 8px;
+        }
+        .header-indicator {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: bold;
+            margin-left: 10px;
+        }
+        .header-f0 {
+            background-color: #4CAF50;
+            color: white;
+        }
+        .header-f1 {
+            background-color: #2196F3;
+            color: white;
+        }
+    </style>
+</head>
+<body class="min-h-screen bg-black flex flex-col items-center justify-center p-4 font-sans text-white">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useCallback, useMemo } = React;
+        const { createRoot } = ReactDOM;
+
+        // WebGL Vertex Shader Source
+        const vsSource = `
+            attribute vec2 aVertexPosition;
+            void main(void) {
+                gl_Position = vec4(aVertexPosition, 0.0, 1.0);
+            }
+        `;
+
+        // WebGL Fragment Shader Source
+        const fsSource = `
+            precision mediump float;
+
+            uniform vec2 uResolution;
+            uniform vec2 uSensorPositions[14];
+            uniform float uSensorValues[14];
+            uniform float uSigma;
+            uniform float uMaxPressureValue;
+            uniform bool uNormalizeData;
+
+            uniform float uT3;
+            uniform float uT60;
+            uniform float uT100;
+            uniform float uT150;
+            uniform float uT180;
+
+            const vec3 cBlack = vec3(0.0, 0.0, 0.0);
+            const vec3 cBlue = vec3(0.0, 0.0, 1.0);
+            const vec3 cGreen = vec3(0.0, 1.0, 0.0);
+            const vec3 cYellow = vec3(1.0, 1.0, 0.0);
+            const vec3 cOrange = vec3(1.0, 0.647, 0.0);
+            const vec3 cRed = vec3(1.0, 0.0, 0.0);
+
+            float getInterpolatedPressureAtPoint(vec2 pixelCoord) {
+                float finalPressure = 0.0;
+                for (int i = 0; i < 14; i++) {
+                    vec2 sensorPixelPos = uSensorPositions[i] * uResolution;
+                    float sensorPressure = uSensorValues[i];
+
+                    vec2 diff = pixelCoord - sensorPixelPos;
+                    float distanceSq = dot(diff, diff);
+
+                    float contribution = sensorPressure * exp(-distanceSq / (2.0 * uSigma * uSigma));
+                    finalPressure += contribution;
+                }
+                return clamp(finalPressure, 0.0, uMaxPressureValue);
+            }
+
+            vec3 getColorForPressure(float pressure) {
+                float effectivePressure = pressure;
+
+                if (uNormalizeData) {
+                    effectivePressure = (pressure / uMaxPressureValue) * 200.0;
+                }
+                
+                effectivePressure = clamp(effectivePressure, 0.0, 200.0);
+
+                vec3 color;
+                if (effectivePressure <= 3.0) {
+                    color = cBlack;
+                } else if (effectivePressure > 3.0 && effectivePressure <= uT3) {
+                    float ratio = (uT3 - 3.0) > 0.0 ? (effectivePressure - 3.0) / (uT3 - 3.0) : 0.0;
+                    color = mix(cBlack, cBlue, ratio);
+                } else if (effectivePressure > uT3 && effectivePressure <= uT60) {
+                    float ratio = (uT60 - uT3) > 0.0 ? (effectivePressure - uT3) / (uT60 - uT3) : 0.0;
+                    color = mix(cBlue, cGreen, ratio);
+                } else if (effectivePressure > uT60 && effectivePressure <= uT100) {
+                    float ratio = (uT100 - uT60) > 0.0 ? (effectivePressure - uT60) / (uT100 - uT60) : 0.0;
+                    color = mix(cGreen, cYellow, ratio);
+                } else if (effectivePressure > uT100 && effectivePressure <= uT150) {
+                    float ratio = (uT150 - uT100) > 0.0 ? (effectivePressure - uT100) / (uT150 - uT100) : 0.0;
+                    color = mix(cYellow, cOrange, ratio);
+                } else if (effectivePressure > uT150 && effectivePressure < uT180) {
+                    float ratio = (uT180 - uT150) > 0.0 ? (effectivePressure - uT150) / (uT180 - uT150) : 0.0;
+                    color = mix(cOrange, cRed, ratio);
+                } else {
+                    color = cRed;
+                }
+                return color;
+            }
+
+            void main(void) {
+                vec2 pixelCoord = vec2(gl_FragCoord.x, uResolution.y - gl_FragCoord.y);
+
+                vec2 center = uResolution / 2.0;
+                float radiusX = uResolution.x * 0.4;
+                float radiusY = uResolution.y * 0.48;
+
+                float ellipseCheck = pow((pixelCoord.x - center.x) / radiusX, 2.0) + pow((pixelCoord.y - center.y) / radiusY, 2.0);
+
+                if (ellipseCheck > 1.0) {
+                    gl_FragColor = vec4(0.06666, 0.06666, 0.06666, 1.0);
+                } else {
+                    float pressure = getInterpolatedPressureAtPoint(pixelCoord);
+                    vec3 color = getColorForPressure(pressure);
+                    gl_FragColor = vec4(color, 1.0);
+                }
+            }
+        `;
+        
+        // Function to generate random sample CSV data with header
+        const generateRandomSampleData = () => {
+            let data = [];
+            const numberOfFrames = 100; // Total frames for each side
+
+            // Generate data for one side (left or right)
+            const generateSideData = (headerValue) => {
+                const baseValues = [
+                    { value: 0, count: 3 }, { value: 10, count: 3 },
+                    { value: 70, count: 3 }, { value: 130, count: 3 },
+                    { value: 180, count: 2 }
+                ];
+                let sideData = [];
+                for (let i = 0; i < numberOfFrames; i++) {
+                    let frameValues = [headerValue];
+                    let sensorValues = [];
+                    baseValues.forEach(base => {
+                        for (let c = 0; c < base.count; c++) {
+                            const offset = Math.floor(Math.random() * 21) - 10;
+                            let newValue = base.value + offset;
+                            newValue = Math.max(0, Math.min(200, newValue)); 
+                            sensorValues.push(newValue);
+                        }
+                    });
+                    const shuffledValues = sensorValues.sort(() => Math.random() - 0.5);
+                    frameValues = frameValues.concat(shuffledValues);
+                    sideData.push(frameValues.join(','));
+                }
+                return sideData;
+            };
+
+            const leftData = generateSideData(250); // 0xF0 for left
+            const rightData = generateSideData(251); // 0xF1 for right
+            
+            // Interleave the data to simulate real-world alternating packets
+            for (let i = 0; i < numberOfFrames; i++) {
+                data.push(leftData[i]);
+                data.push(rightData[i]);
+            }
+            
+            return data.join('\n');
+        };
+
+        // Main App component
+        const App = () => {
+            const leftCanvasRef = useRef(null);
+            const leftOverlayCanvasRef = useRef(null);
+            const leftGraphCanvasRef = useRef(null);
+            const rightCanvasRef = useRef(null);
+            const rightOverlayCanvasRef = useRef(null);
+            const rightGraphCanvasRef = useRef(null);
+
+            const leftGlRef = useRef({ gl: null, program: null, positionBuffer: null });
+            const rightGlRef = useRef({ gl: null, program: null, positionBuffer: null });
+
+            const [leftSimulationData, setLeftSimulationData] = useState([]);
+            const [rightSimulationData, setRightSimulationData] = useState([]);
+            const [currentFrame, setCurrentFrame] = useState(0);
+
+            const [hoverInfo, setHoverInfo] = useState({ value: null, x: 0, y: 0, side: null });
+
+            const [leftTrajectoryPoints, setLeftTrajectoryPoints] = useState([]);
+            const [rightTrajectoryPoints, setRightTrajectoryPoints] = useState([]);
+            const [showCoF, setShowCoF] = useState(true);
+
+            const [sigma, setSigma] = useState(35);
+            const [colorFactor, setColorFactor] = useState(6.0);
+            const [normalizeData, setNormalizeData] = useState(false);
+            
+            const createInitialStats = () => ({
+                totalPressure: 0, forefootAvg: 0, forefootMax: 0,
+                midfootAvg: 0, midfootMax: 0, heelAvg: 0, heelMax: 0,
+                cofDistance: 0
+            });
+
+            const [leftFootRegionStats, setLeftFootRegionStats] = useState(createInitialStats());
+            const [rightFootRegionStats, setRightFootRegionStats] = useState(createInitialStats());
+
+            const [leftTotalPressureHistory, setLeftTotalPressureHistory] = useState([]);
+            const [rightTotalPressureHistory, setRightTotalPressureHistory] = useState([]);
+            const MAX_GRAPH_POINTS = 50;
+
+            const maxPressureValue = sigma * colorFactor; 
+
+            const baseLegendRatios = useMemo(() => ({
+                t3: 3 / 200, t60: 60 / 200, t100: 100 / 200,
+                t150: 150 / 200, t180: 180 / 200,
+            }), []);
+
+            const [legendConfig, setLegendConfig] = useState([]);
+            const sampleCsvData = useMemo(() => generateRandomSampleData(), []);
+            const cofImageRef = useRef(null);
+
+            const [simulationFps, setSimulationFps] = useState(12);
+            const [isPlaying, setIsPlaying] = useState(false);
+            
+            const maxFrames = Math.max(leftSimulationData.length, rightSimulationData.length);
+
+            const sensorPositions = [
+                { x: 0.25, y: 0.20, name: "Big Toe Left" }, { x: 0.40, y: 0.15, name: "Second Toe Left" },
+                { x: 0.60, y: 0.15, name: "Second Toe Right" }, { x: 0.75, y: 0.20, name: "Big Toe Right" },
+                { x: 0.30, y: 0.35, name: "Forefoot Outer Left" }, { x: 0.45, y: 0.35, name: "Forefoot Inner Left" },
+                { x: 0.60, y: 0.35, name: "Forefoot Inner Right" }, { x: 0.75, y: 0.35, name: "Forefoot Outer Right" },
+                { x: 0.30, y: 0.55, name: "Mid-foot Outer Left" }, { x: 0.45, y: 0.55, name: "Mid-foot Inner Left" },
+                { x: 0.60, y: 0.55, name: "Mid-foot Inner Right" }, { x: 0.75, y: 0.55, name: "Mid-foot Outer Right" },
+                { x: 0.40, y: 0.9, name: "Heel Left" }, { x: 0.60, y: 0.9, name: "Heel Right" }
+            ];
+
+            useEffect(() => {
+                setLegendConfig([
+                    { id: 't3', label: `파랑`, value: Math.round(baseLegendRatios.t3 * maxPressureValue), color: { r: 0, g: 0, b: 255 } },
+                    { id: 't60', label: `녹색`, value: Math.round(baseLegendRatios.t60 * maxPressureValue), color: { r: 0, g: 255, b: 0 } },
+                    { id: 't100', label: `노랑`, value: Math.round(baseLegendRatios.t100 * maxPressureValue), color: { r: 255, g: 255, b: 0 } },
+                    { id: 't150', label: `주황`, value: Math.round(baseLegendRatios.t150 * maxPressureValue), color: { r: 255, g: 165, b: 0 } },
+                    { id: 't180', label: `빨강`, value: Math.round(baseLegendRatios.t180 * maxPressureValue), color: { r: 255, g: 0, b: 0 } },
+                ]);
+            }, [sigma, maxPressureValue, baseLegendRatios]);
+
+            const getInterpolatedPressureAtPoint = useCallback((mouseX, mouseY, currentSensorValues, canvasWidth, canvasHeight) => {
+                if (!currentSensorValues) return 0;
+                let finalPressure = 0;
+                for (let i = 0; i < sensorPositions.length; i++) {
+                    const sensorX = sensorPositions[i].x * canvasWidth;
+                    const sensorY = sensorPositions[i].y * canvasHeight;
+                    const sensorPressure = currentSensorValues[i];
+
+                    const dx = mouseX - sensorX;
+                    const dy = mouseY - sensorY;
+                    const distance = Math.sqrt(dx * dx + dy * dy);
+
+                    const contribution = sensorPressure * Math.exp(- (distance * distance) / (2 * sigma * sigma));
+                    finalPressure += contribution;
+                }
+                finalPressure = Math.max(0, Math.min(maxPressureValue, finalPressure));
+                return finalPressure;
+            }, [sensorPositions, sigma, maxPressureValue]);
+
+            const calculateCoF = useCallback((sensorValues, canvasWidth, canvasHeight) => {
+                if (!sensorValues) return { x: canvasWidth / 2, y: canvasHeight / 2 };
+                let totalPressure = 0, weightedX = 0, weightedY = 0;
+                for (let i = 0; i < sensorPositions.length; i++) {
+                    const pressure = sensorValues[i];
+                    totalPressure += pressure;
+                    weightedX += pressure * sensorPositions[i].x * canvasWidth;
+                    weightedY += pressure * sensorPositions[i].y * canvasHeight;
+                }
+                return totalPressure === 0 ? { x: canvasWidth / 2, y: canvasHeight / 2 } : { x: weightedX / totalPressure, y: weightedY / totalPressure };
+            }, [sensorPositions]);
+
+            const calculateFootRegionStats = useCallback((sensorValues, currentTrajectoryPoints) => {
+                if (!sensorValues) return createInitialStats();
+                
+                let totalPressure = 0, forefootPressures = [], midfootPressures = [], heelPressures = [];
+                sensorValues.forEach((pressure, index) => {
+                    totalPressure += pressure;
+                    if (index <= 7) forefootPressures.push(pressure);
+                    else if (index <= 11) midfootPressures.push(pressure);
+                    else heelPressures.push(pressure);
+                });
+                const getStats = (arr) => arr.length === 0 ? { avg: 0, max: 0 } : { avg: arr.reduce((a, b) => a + b, 0) / arr.length, max: Math.max(...arr) };
+
+                let cofMovementDistance = 0;
+                if (currentTrajectoryPoints && currentTrajectoryPoints.length > 1) {
+                    for (let i = 1; i < currentTrajectoryPoints.length; i++) {
+                        const p1 = currentTrajectoryPoints[i - 1], p2 = currentTrajectoryPoints[i];
+                        cofMovementDistance += Math.sqrt(Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2));
+                    }
+                }
+                const forefootStats = getStats(forefootPressures);
+                const midfootStats = getStats(midfootPressures);
+                const heelStats = getStats(heelPressures);
+                return {
+                    totalPressure,
+                    forefootAvg: forefootStats.avg, forefootMax: forefootStats.max,
+                    midfootAvg: midfootStats.avg, midfootMax: midfootStats.max,
+                    heelAvg: heelStats.avg, heelMax: heelStats.max,
+                    cofDistance: cofMovementDistance
+                };
+            }, []);
+            
+            const drawTotalPressureGraph = useCallback((graphCanvas, history) => {
+                if (!graphCanvas) return;
+                const ctx = graphCanvas.getContext('2d');
+                const { width, height } = graphCanvas;
+                ctx.clearRect(0, 0, width, height);
+                ctx.fillStyle = '#111';
+                ctx.fillRect(0, 0, width, height);
+
+                if (history.length === 0) {
+                    ctx.fillStyle = '#888'; ctx.font = '12px Arial'; ctx.textAlign = 'center';
+                    ctx.fillText('데이터 없음', width / 2, height / 2);
+                    return;
+                }
+                const minPressure = 0, maxPressure = Math.max(...history, 1);
+                ctx.strokeStyle = '#333'; ctx.lineWidth = 0.5;
+                for (let i = 0; i <= 5; i++) {
+                    const y = height - (i * (height / 5));
+                    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke();
+                }
+                ctx.beginPath(); ctx.strokeStyle = '#00FF7F'; ctx.lineWidth = 2;
+                const xStep = width / (MAX_GRAPH_POINTS - 1);
+                history.forEach((pressure, index) => {
+                    const x = index * xStep;
+                    const y = height - ((pressure - minPressure) / (maxPressure - minPressure)) * height;
+                    if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                });
+                ctx.stroke();
+                ctx.fillStyle = '#FFF'; ctx.font = '10px Arial'; ctx.textAlign = 'left';
+                ctx.fillText(maxPressure.toFixed(0), 5, 10);
+                ctx.fillText(minPressure.toFixed(0), 5, height - 5);
+            }, []);
+
+            const drawOverlay = useCallback((overlayCanvas, sensorValues, currentTrajectoryPoints) => {
+                if (!overlayCanvas) return;
+                 const ctx = overlayCanvas.getContext('2d');
+                const { width, height } = overlayCanvas;
+                ctx.clearRect(0, 0, width, height);
+
+                if (!sensorValues) return;
+               
+                sensorPositions.forEach((pos, index) => {
+                    const sensorX = pos.x * width, sensorY = pos.y * height, sensorValue = sensorValues[index];
+                    if (typeof sensorValue === 'number' && !isNaN(sensorValue)) {
+                        ctx.beginPath(); ctx.arc(sensorX, sensorY, 7, 0, 2 * Math.PI);
+                        ctx.fillStyle = 'rgba(255, 255, 0, 0.8)'; ctx.fill();
+                        ctx.strokeStyle = 'rgba(255, 0, 0, 0.8)'; ctx.lineWidth = 2; ctx.stroke();
+                        ctx.fillStyle = 'black'; ctx.font = '14px Arial'; ctx.textAlign = 'center';
+                        ctx.fillText(sensorValue.toFixed(0), sensorX, sensorY + 4);
+                    }
+                });
+
+                if (showCoF && currentTrajectoryPoints && currentTrajectoryPoints.length > 0) {
+                    ctx.strokeStyle = '#000000'; ctx.lineWidth = 1; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+                    ctx.beginPath();
+                    ctx.moveTo(currentTrajectoryPoints[0].x, currentTrajectoryPoints[0].y);
+                    currentTrajectoryPoints.forEach(p => ctx.lineTo(p.x, p.y));
+                    ctx.stroke();
+
+                    const currentCoF = currentTrajectoryPoints[currentTrajectoryPoints.length - 1];
+                    const imgSize = 20;
+                    if (cofImageRef.current && cofImageRef.current.complete) {
+                        ctx.drawImage(cofImageRef.current, currentCoF.x - imgSize / 2, currentCoF.y - imgSize / 2, imgSize, imgSize);
+                    }
+                }
+            }, [showCoF, sensorPositions]);
+
+            const drawHeatmapWebGL = useCallback((glObjects, canvas, sensorValues) => {
+                const { gl, program, positionBuffer } = glObjects;
+                if (!gl || !program || !positionBuffer || !canvas) return;
+
+                 if (!sensorValues || sensorValues.length === 0) {
+                     gl.clearColor(0.06666, 0.06666, 0.06666, 1.0);
+                     gl.clear(gl.COLOR_BUFFER_BIT);
+                     return;
+                 }
+
+                gl.viewport(0, 0, canvas.width, canvas.height);
+                gl.clearColor(0.06666, 0.06666, 0.06666, 1.0);
+                gl.clear(gl.COLOR_BUFFER_BIT);
+
+                gl.useProgram(program);
+
+                gl.uniform2f(gl.getUniformLocation(program, 'uResolution'), canvas.width, canvas.height);
+                const flatSensorPositions = sensorPositions.flatMap(p => [p.x, p.y]);
+                gl.uniform2fv(gl.getUniformLocation(program, 'uSensorPositions'), flatSensorPositions);
+                gl.uniform1fv(gl.getUniformLocation(program, 'uSensorValues'), new Float32Array(sensorValues));
+                gl.uniform1f(gl.getUniformLocation(program, 'uSigma'), sigma);
+                gl.uniform1f(gl.getUniformLocation(program, 'uMaxPressureValue'), maxPressureValue);
+                gl.uniform1i(gl.getUniformLocation(program, 'uNormalizeData'), normalizeData ? 1 : 0);
+
+                const t3 = legendConfig.find(item => item.id === 't3')?.value || 0;
+                const t60 = legendConfig.find(item => item.id === 't60')?.value || 0;
+                const t100 = legendConfig.find(item => item.id === 't100')?.value || 0;
+                const t150 = legendConfig.find(item => item.id === 't150')?.value || 0;
+                const t180 = legendConfig.find(item => item.id === 't180')?.value || 0;
+
+                gl.uniform1f(gl.getUniformLocation(program, 'uT3'), normalizeData ? Math.round(baseLegendRatios.t3 * 200) : t3);
+                gl.uniform1f(gl.getUniformLocation(program, 'uT60'), normalizeData ? Math.round(baseLegendRatios.t60 * 200) : t60);
+                gl.uniform1f(gl.getUniformLocation(program, 'uT100'), normalizeData ? Math.round(baseLegendRatios.t100 * 200) : t100);
+                gl.uniform1f(gl.getUniformLocation(program, 'uT150'), normalizeData ? Math.round(baseLegendRatios.t150 * 200) : t150);
+                gl.uniform1f(gl.getUniformLocation(program, 'uT180'), normalizeData ? Math.round(baseLegendRatios.t180 * 200) : t180);
+                
+                const aVertexPositionLoc = gl.getAttribLocation(program, 'aVertexPosition');
+                gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+                gl.vertexAttribPointer(aVertexPositionLoc, 2, gl.FLOAT, false, 0, 0);
+                gl.enableVertexAttribArray(aVertexPositionLoc);
+                gl.drawArrays(gl.TRIANGLES, 0, 6);
+            }, [sensorPositions, sigma, maxPressureValue, normalizeData, legendConfig, baseLegendRatios]);
+
+            const stopSimulation = useCallback(() => setIsPlaying(false), []);
+
+            const startSimulation = useCallback((forcedMaxFrames) => {
+                const effectiveMaxFrames = forcedMaxFrames !== undefined ? forcedMaxFrames : maxFrames;
+
+                if (effectiveMaxFrames === 0) {
+                    alert('CSV 파일을 먼저 로드해주세요!');
+                    return;
+                }
+                if (currentFrame >= effectiveMaxFrames - 1) {
+                    setCurrentFrame(0);
+                    setLeftTrajectoryPoints([]);
+                    setRightTrajectoryPoints([]);
+                    setLeftTotalPressureHistory([]);
+                    setRightTotalPressureHistory([]);
+                }
+                setIsPlaying(true);
+            }, [maxFrames, currentFrame]);
+
+            const parseCsvData = useCallback((csvString) => {
+                stopSimulation();
+                const lines = csvString.trim().split('\n');
+                const parsedLeft = [], parsedRight = [];
+
+                lines.forEach(row => {
+                    const values = row.split(',').map(Number);
+                    if (values.length === 15 && !isNaN(values[0])) {
+                        const header = values[0];
+                        const sensorData = values.slice(1);
+                        if (header === 250) parsedLeft.push(sensorData);
+                        else if (header === 251) parsedRight.push(sensorData);
+                    }
+                });
+
+                if (parsedLeft.length > 0 || parsedRight.length > 0) {
+                    setLeftSimulationData(parsedLeft);
+                    setRightSimulationData(parsedRight);
+                    setCurrentFrame(0);
+                    setLeftTrajectoryPoints([]);
+                    setRightTrajectoryPoints([]);
+                    setLeftTotalPressureHistory([]);
+                    setRightTotalPressureHistory([]);
+                    return Math.max(parsedLeft.length, parsedRight.length);
+                } else {
+                    alert('유효한 데이터가 CSV 파일에 없습니다. (헤더+14개 값 형식 필요)');
+                    return 0;
+                }
+            }, [stopSimulation]);
+
+            const loadSampleAndStartSimulation = useCallback(() => {
+                const newMaxFrames = parseCsvData(sampleCsvData);
+                setTimeout(() => {
+                    startSimulation(newMaxFrames);
+                }, 100);
+            }, [parseCsvData, sampleCsvData, startSimulation]);
+            
+            const updateFrame = useCallback(() => {
+                const leftData = leftSimulationData[currentFrame];
+                const rightData = rightSimulationData[currentFrame];
+                
+                drawHeatmapWebGL(leftGlRef.current, leftCanvasRef.current, leftData);
+                drawHeatmapWebGL(rightGlRef.current, rightCanvasRef.current, rightData);
+                
+                const leftTraj = showCoF && leftData ? leftTrajectoryPoints : [];
+                const rightTraj = showCoF && rightData ? rightTrajectoryPoints : [];
+
+                setLeftFootRegionStats(calculateFootRegionStats(leftData, leftTraj));
+                setRightFootRegionStats(calculateFootRegionStats(rightData, rightTraj));
+                
+                drawOverlay(leftOverlayCanvasRef.current, leftData, leftTraj);
+                drawOverlay(rightOverlayCanvasRef.current, rightData, rightTraj);
+            }, [currentFrame, leftSimulationData, rightSimulationData, drawHeatmapWebGL, showCoF, leftTrajectoryPoints, rightTrajectoryPoints, calculateFootRegionStats, drawOverlay]);
+            
+            const handleFrameChange = useCallback((direction) => {
+                stopSimulation();
+                setCurrentFrame(prevFrame => {
+                    return (prevFrame + direction + maxFrames) % maxFrames;
+                });
+            }, [stopSimulation, maxFrames]);
+
+            const handleLegendValueChange = useCallback((id, newValue) => {
+                setLegendConfig(prevConfig => prevConfig.map(item =>
+                    item.id === id ? { ...item, value: Math.max(0, Math.min(maxPressureValue, Number(newValue))) } : item
+                ));
+            }, [maxPressureValue]);
+
+            const handleApplyLegend = useCallback(() => {
+                if (maxFrames > 0) {
+                    updateFrame();
+                }
+            }, [updateFrame, maxFrames]);
+
+
+            useEffect(() => {
+                drawTotalPressureGraph(leftGraphCanvasRef.current, leftTotalPressureHistory);
+                drawTotalPressureGraph(rightGraphCanvasRef.current, rightTotalPressureHistory);
+            }, [leftTotalPressureHistory, rightTotalPressureHistory]);
+
+            useEffect(() => {
+                let intervalId = null;
+                if (isPlaying) {
+                    intervalId = setInterval(() => {
+                        setCurrentFrame(prevFrame => {
+                            const nextFrame = (prevFrame + 1);
+                            if (nextFrame >= maxFrames) {
+                                setLeftTrajectoryPoints([]);
+                                setRightTrajectoryPoints([]);
+                                setLeftTotalPressureHistory([]);
+                                setRightTotalPressureHistory([]);
+                                return 0;
+                            }
+                            return nextFrame;
+                        });
+                    }, 1000 / simulationFps);
+                }
+                return () => clearInterval(intervalId);
+            }, [isPlaying, simulationFps, maxFrames]);
+            
+            useEffect(() => {
+                if (isPlaying && maxFrames > 0) {
+                    const leftData = leftSimulationData[currentFrame];
+                    const rightData = rightSimulationData[currentFrame];
+                    if (leftData) {
+                        setLeftTrajectoryPoints(traj => [...traj, calculateCoF(leftData, 300, 600)]);
+                        setLeftTotalPressureHistory(hist => [...hist.slice(-MAX_GRAPH_POINTS + 1), leftData.reduce((s,v)=>s+v, 0)]);
+                    }
+                    if (rightData) {
+                        setRightTrajectoryPoints(traj => [...traj, calculateCoF(rightData, 300, 600)]);
+                        setRightTotalPressureHistory(hist => [...hist.slice(-MAX_GRAPH_POINTS + 1), rightData.reduce((s,v)=>s+v, 0)]);
+                    }
+                }
+            }, [currentFrame, isPlaying, maxFrames, leftSimulationData, rightSimulationData, calculateCoF]);
+
+            useEffect(() => {
+                 if (maxFrames > 0) {
+                    updateFrame();
+                }
+            }, [currentFrame, isPlaying, maxFrames, legendConfig, updateFrame]);
+
+
+            const handleFileChange = useCallback((event) => {
+                const file = event.target.files[0];
+                if (file) {
+                    const reader = new FileReader();
+                    reader.onload = (e) => parseCsvData(e.target.result);
+                    reader.readAsText(file);
+                }
+            }, [parseCsvData]);
+
+            const handleSaveScreenshot = useCallback(() => {
+                const tempCanvas = document.createElement('canvas');
+                tempCanvas.width = 620; 
+                tempCanvas.height = 600;
+                const tempCtx = tempCanvas.getContext('2d');
+                tempCtx.fillStyle = '#000';
+                tempCtx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
+                
+                if (leftCanvasRef.current && leftOverlayCanvasRef.current) {
+                    tempCtx.drawImage(leftCanvasRef.current, 0, 0);
+                    tempCtx.drawImage(leftOverlayCanvasRef.current, 0, 0);
+                }
+                 if (rightCanvasRef.current && rightOverlayCanvasRef.current) {
+                    tempCtx.drawImage(rightCanvasRef.current, 320, 0);
+                    tempCtx.drawImage(rightOverlayCanvasRef.current, 320, 0);
+                }
+
+                const link = document.createElement('a');
+                link.href = tempCanvas.toDataURL('image/png');
+                link.download = '인솔_히트맵_듀얼뷰_스크린샷.png';
+                link.click();
+            }, []);
+            
+            const initWebGL = (canvas) => {
+                if (!canvas) return { gl: null, program: null, positionBuffer: null };
+                const gl = canvas.getContext('webgl', { preserveDrawingBuffer: true });
+                if (!gl) { console.error('WebGL init failed.'); return {}; }
+
+                const createShader = (type, source) => {
+                    const shader = gl.createShader(type);
+                    gl.shaderSource(shader, source);
+                    gl.compileShader(shader);
+                    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                        console.error('Shader compile error: ' + gl.getShaderInfoLog(shader));
+                        gl.deleteShader(shader); return null;
+                    }
+                    return shader;
+                };
+                const vertexShader = createShader(gl.VERTEX_SHADER, vsSource);
+                const fragmentShader = createShader(gl.FRAGMENT_SHADER, fsSource);
+                const program = gl.createProgram();
+                gl.attachShader(program, vertexShader);
+                gl.attachShader(program, fragmentShader);
+                gl.linkProgram(program);
+
+                if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+                    console.error('Program link error: ' + gl.getProgramInfoLog(program)); return {};
+                }
+                const positions = [-1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, -1.0];
+                const positionBuffer = gl.createBuffer();
+                gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+                gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
+                
+                gl.clearColor(0.06666, 0.06666, 0.06666, 1.0);
+                gl.clear(gl.COLOR_BUFFER_BIT);
+                return { gl, program, positionBuffer };
+            };
+
+            useEffect(() => {
+                leftGlRef.current = initWebGL(leftCanvasRef.current);
+                rightGlRef.current = initWebGL(rightCanvasRef.current);
+                
+                const img = new Image();
+                img.crossOrigin = "anonymous";
+                img.src = "https://upload.wikimedia.org/wikipedia/commons/0/0d/10_m_Air_Rifle_target.svg"; 
+                img.onload = () => cofImageRef.current = img;
+            }, []);
+            
+            const handleMouseMove = useCallback((event, side) => {
+                const canvas = side === 'left' ? leftOverlayCanvasRef.current : rightOverlayCanvasRef.current;
+                const data = side === 'left' ? leftSimulationData : rightSimulationData;
+                if (!canvas || !data || data.length === 0 || !data[currentFrame]) return;
+
+                const rect = canvas.getBoundingClientRect();
+                const mouseX = event.clientX - rect.left, mouseY = event.clientY - rect.top;
+
+                if (mouseX >= 0 && mouseX <= canvas.width && mouseY >= 0 && mouseY <= canvas.height) {
+                    const interpolatedValue = getInterpolatedPressureAtPoint(mouseX, mouseY, data[currentFrame], canvas.width, canvas.height);
+                    setHoverInfo({ value: interpolatedValue.toFixed(2), x: event.clientX, y: event.clientY, side });
+                } else {
+                    setHoverInfo({ value: null, x: 0, y: 0, side: null });
+                }
+            }, [leftSimulationData, rightSimulationData, currentFrame, getInterpolatedPressureAtPoint]);
+
+            const handleMouseLeave = useCallback(() => setHoverInfo({ value: null, x: 0, y: 0, side: null }), []);
+
+            return (
+                <div className="min-h-screen bg-black flex flex-col items-center justify-center p-4 font-sans text-white">
+                    <h1 className="text-3xl font-bold mb-6 text-white">
+                        인솔 압력 히트맵 시뮬레이터 V.3.4.4 (듀얼 뷰)
+                    </h1>
+
+                    <div className="flex flex-col md:flex-row items-start justify-center space-y-4 md:space-y-0 md:space-x-8 bg-gray-800 p-8 rounded-lg shadow-xl border border-gray-700">
+                        {/* Left Controls Section */}
+                        <div className="flex flex-col items-center space-y-3 md:order-1 order-2 md:w-auto w-full px-2 py-2 rounded-lg bg-gray-700">
+                           <h2 className="text-xl font-semibold mb-2 text-white">공통 설정</h2>
+                            <div className="flex flex-col text-sm text-gray-300">
+                                {legendConfig.map((item) => (
+                                    <div key={item.id} className="flex items-center mb-2">
+                                        <span className="text-gray-300 w-12 text-right text-xs mr-1">{item.label}</span>
+                                        <input
+                                            type="number"
+                                            value={item.value}
+                                            onChange={(e) => handleLegendValueChange(item.id, e.target.value)}
+                                            className="w-16 p-0.5 rounded bg-gray-700 text-white border border-gray-600 focus:outline-none focus:border-blue-500 mr-1 text-xs"
+                                            min={0}
+                                            max={maxPressureValue}
+                                        />
+                                        <div className="legend-color-box" style={{backgroundColor: `rgb(${item.color.r}, ${item.color.g}, ${item.color.b})`}}></div>
+                                    </div>
+                                ))}
+                                <button
+                                    onClick={handleApplyLegend}
+                                    className="bg-teal-600 hover:bg-teal-700 text-white font-semibold py-1.5 px-3 rounded-lg shadow-md control-button w-full mt-2 text-sm"
+                                >
+                                    레전드 적용
+                                </button>
+                            </div>
+                            <div className="flex items-center mt-3 w-full justify-center space-x-1">
+                                <label className="text-gray-300 text-sm whitespace-nowrap">컬러 계수:</label>
+                                <input type="number" value={colorFactor.toFixed(1)} onChange={(e) => setColorFactor(Math.max(0.1, parseFloat(e.target.value)))} className="w-14 p-0.5 rounded bg-gray-700 text-white border border-gray-600 text-center focus:outline-none focus:border-blue-500 text-xs" step="0.1" min={0.1}/>
+                            </div>
+                             <div className="flex items-center mt-3 w-full justify-center space-x-1">
+                                <label className="text-gray-300 text-sm">시그마:</label>
+                                <input type="number" value={sigma} onChange={(e) => setSigma(Math.max(1, Number(e.target.value)))} className="w-14 p-0.5 rounded bg-gray-700 text-white border border-gray-600 text-center focus:outline-none focus:border-blue-500 text-xs" min={1}/>
+                            </div>
+                            <div className="flex items-center mt-3 w-full justify-center">
+                                <input type="checkbox" id="normalizeData" checked={normalizeData} onChange={(e) => setNormalizeData(e.target.checked)} className="mr-1.5 h-3.5 w-3.5"/>
+                                <label htmlFor="normalizeData" className="text-gray-300 text-sm">데이터 정규화</label>
+                            </div>
+                            <div className="flex items-center mt-3 w-full justify-center">
+                                <input type="checkbox" id="showCof" checked={showCoF} onChange={(e) => setShowCoF(e.target.checked)} className="mr-1.5 h-3.5 w-3.5"/>
+                                <label htmlFor="showCof" className="text-gray-300 text-sm">CoF 궤적 보이기</label>
+                            </div>
+                        </div>
+
+                        {/* Canvas Section */}
+                        <div className="flex space-x-4">
+                            {/* Left Heatmap */}
+                            <div className="flex flex-col items-center">
+                                <h2 className="text-xl font-bold mb-2 text-white">LEFT (좌)</h2>
+                                <div className="canvas-container">
+                                    <canvas ref={leftCanvasRef} width="300" height="600" className="insole-canvas"></canvas>
+                                    <canvas ref={leftOverlayCanvasRef} width="300" height="600" className="overlay-canvas" onMouseMove={(e) => handleMouseMove(e, 'left')} onMouseLeave={handleMouseLeave}></canvas>
+                                </div>
+                                 <div className="analysis-box text-gray-300 min-w-[250px]">
+                                    <h3 className="text-base font-semibold text-white">압력 통계 (좌)</h3>
+                                    <p className="text-xs">총 압력: {leftFootRegionStats.totalPressure.toFixed(0)}</p>
+                                    <p className="text-xs">전족부 평균/최대: {leftFootRegionStats.forefootAvg.toFixed(0)}/{leftFootRegionStats.forefootMax.toFixed(0)}</p>
+                                    <p className="text-xs">CoF 이동 거리: {leftFootRegionStats.cofDistance.toFixed(2)}</p>
+                                </div>
+                                <div className="mt-2 w-full">
+                                    <canvas ref={leftGraphCanvasRef} width="300" height="100" className="graph-canvas"></canvas>
+                                </div>
+                            </div>
+                            
+                            {/* Right Heatmap */}
+                            <div className="flex flex-col items-center">
+                               <h2 className="text-xl font-bold mb-2 text-white">RIGHT (우)</h2>
+                                <div className="canvas-container">
+                                    <canvas ref={rightCanvasRef} width="300" height="600" className="insole-canvas"></canvas>
+                                    <canvas ref={rightOverlayCanvasRef} width="300" height="600" className="overlay-canvas" onMouseMove={(e) => handleMouseMove(e, 'right')} onMouseLeave={handleMouseLeave}></canvas>
+                                </div>
+                                 <div className="analysis-box text-gray-300 min-w-[250px]">
+                                    <h3 className="text-base font-semibold text-white">압력 통계 (우)</h3>
+                                    <p className="text-xs">총 압력: {rightFootRegionStats.totalPressure.toFixed(0)}</p>
+                                    <p className="text-xs">전족부 평균/최대: {rightFootRegionStats.forefootAvg.toFixed(0)}/{rightFootRegionStats.forefootMax.toFixed(0)}</p>
+                                    <p className="text-xs">CoF 이동 거리: {rightFootRegionStats.cofDistance.toFixed(2)}</p>
+                                </div>
+                                <div className="mt-2 w-full">
+                                    <canvas ref={rightGraphCanvasRef} width="300" height="100" className="graph-canvas"></canvas>
+                                </div>
+                            </div>
+                             {hoverInfo.value !== null && (
+                                <div className="floating-value" style={{ left: hoverInfo.x, top: hoverInfo.y }}>
+                                    값: {hoverInfo.value}
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Right Controls Section */}
+                        <div className="flex flex-col items-center space-y-3 md:order-3 order-3 md:w-auto w-full px-2 py-2 rounded-lg bg-gray-700">
+                             <h2 className="text-xl font-semibold mb-2 text-white">제어</h2>
+                            <button onClick={loadSampleAndStartSimulation} className="bg-purple-600 hover:bg-purple-700 text-white font-semibold py-2 px-4 rounded-lg shadow-md control-button w-full text-sm">샘플 로드 및 시작</button>
+                            <label htmlFor="csvFileInput" className="cursor-pointer bg-blue-500 hover:bg-blue-600 text-white font-semibold py-2 px-4 rounded-lg shadow-md control-button w-full text-center text-sm">
+                                CSV 파일 선택
+                                <input type="file" id="csvFileInput" accept=".csv" onChange={handleFileChange} className="hidden"/>
+                            </label>
+                            <div className="flex items-center w-full justify-center space-x-1">
+                                <label className="text-gray-300 text-sm whitespace-nowrap">FPS:</label>
+                                <input type="number" value={simulationFps} onChange={(e) => setSimulationFps(Math.max(1, Number(e.target.value)))} className="w-14 p-0.5 rounded bg-gray-700 text-white border border-gray-600 text-center focus:outline-none focus:border-blue-500 text-xs" min={1}/>
+                            </div>
+                            <button onClick={() => startSimulation()} className="bg-green-500 hover:bg-green-600 text-white font-semibold py-2 px-4 rounded-lg shadow-md control-button w-full text-sm">시작</button>
+                            <button onClick={stopSimulation} className="bg-red-500 hover:bg-red-600 text-white font-semibold py-2 px-4 rounded-lg shadow-md control-button w-full text-sm">중지</button>
+                            <div className="flex space-x-2 mt-2 w-full">
+                                <button onClick={() => handleFrameChange(-1)} className="bg-gray-700 hover:bg-gray-600 text-white font-semibold py-1.5 px-3 rounded-lg shadow-md control-button flex-grow text-sm">이전</button>
+                                <button onClick={() => handleFrameChange(1)} className="bg-gray-700 hover:bg-gray-600 text-white font-semibold py-1.5 px-3 rounded-lg shadow-md control-button flex-grow text-sm">다음</button>
+                            </div>
+                            <button onClick={handleSaveScreenshot} className="bg-orange-500 hover:bg-orange-600 text-white font-semibold py-2 px-4 rounded-lg shadow-md control-button w-full text-sm mt-4">스크린샷 저장</button>
+                            <div className="mt-4 text-gray-300 text-xs">
+                                <p>Frame: {currentFrame + 1} / {maxFrames}</p>
+                                <p className="mt-2">CSV 형식: 헤더(250/251),센서1..14</p>
+                                <p className="font-mono bg-gray-700 p-1 rounded mt-1">250,10,20,...,140</p>
+                                <p className="font-mono bg-gray-700 p-1 rounded mt-1">251,15,25,...,145</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // Render the App component into the root div
+        const container = document.getElementById('root');
+        const root = createRoot(container);
+        root.render(<App />);
+    </script>
+</body>
+</html>
